@@ -508,6 +508,33 @@ class RecformerForPretraining(LongformerPreTrainedModel):
             masked_lm_loss_b = loss_fct(prediction_scores_b.view(-1, self.config.vocab_size), mlm_labels_b.view(-1))
             loss = loss + self.config.mlm_weight * masked_lm_loss_b
 
+
+        # Extract sequence-level representations
+        seq_repr_a = torch.mean(outputs_a.last_hidden_state, dim=1)  # Mean pooling over tokens
+        seq_repr_b = torch.mean(outputs_b.last_hidden_state, dim=1)
+
+        # Gather sequence embeddings for distributed training
+        if dist.is_initialized() and self.training:
+            seq_a_list = [torch.zeros_like(seq_repr_a) for _ in range(dist.get_world_size())]
+            seq_b_list = [torch.zeros_like(seq_repr_b) for _ in range(dist.get_world_size())]
+            dist.all_gather(tensor_list=seq_a_list, tensor=seq_repr_a.contiguous())
+            dist.all_gather(tensor_list=seq_b_list, tensor=seq_repr_b.contiguous())
+            seq_a_list[dist.get_rank()] = seq_repr_a
+            seq_b_list[dist.get_rank()] = seq_repr_b
+            seq_repr_a = torch.cat(seq_a_list, 0)
+            seq_repr_b = torch.cat(seq_b_list, 0)
+
+        #Compute sequence similarity matrix
+        seq_sim = self.sim(seq_repr_a.unsqueeze(1), seq_repr_b.unsqueeze(0))
+
+        #Define sequence contrastive labels
+        seq_labels = torch.arange(seq_sim.size(0)).long().to(seq_sim.device)
+
+        #Compute sequence contrastive loss
+        loss_fct = CrossEntropyLoss()
+        sequence_contrastive_loss = loss_fct(seq_sim, seq_labels)
+        loss += sequence_contrastive_loss
+
         return RecformerPretrainingOutput(
             loss=loss,
             logits=cos_sim,
